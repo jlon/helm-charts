@@ -1,0 +1,251 @@
+name: Build and Release Helm Chart
+
+on:
+  push:
+    branches:
+      - main  # Main branch updates
+    tags:
+      - 'v*'  # v* tags for release
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: 'latest'
+
+      - name: Extract tag/version information
+        id: tag
+        run: |
+          # Handle tag push
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            IS_TAG=true
+            IS_MAIN_BRANCH=false
+          # Handle main branch push
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            TAG="latest"
+            IS_TAG=false
+            IS_MAIN_BRANCH=true
+          else
+            echo "Error: Unexpected ref: $GITHUB_REF"
+            exit 1
+          fi
+          
+          # Extract version from tag (remove 'v' prefix if present)
+          if [[ "$TAG" == v* ]]; then
+            VERSION=${TAG#v}
+          elif [ "$IS_MAIN_BRANCH" == "true" ]; then
+            # For main branch, will be set in next step after reading Chart.yaml
+            VERSION=""
+          else
+            VERSION=$TAG
+          fi
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is_tag=$IS_TAG" >> $GITHUB_OUTPUT
+          echo "is_main_branch=$IS_MAIN_BRANCH" >> $GITHUB_OUTPUT
+          echo "Tag/Version: $TAG ($VERSION)"
+          echo "Is Tag: $IS_TAG"
+          echo "Is Main Branch: $IS_MAIN_BRANCH"
+
+      - name: Prepare pre-release version for main branch
+        if: steps.tag.outputs.is_main_branch == 'true'
+        id: prerelease
+        run: |
+          # Read current version from Chart.yaml
+          CURRENT_VERSION=$(grep '^version:' helm/Chart.yaml | awk '{print $2}' | tr -d '"')
+          echo "Current Chart version: $CURRENT_VERSION"
+          
+          # Extract base version (remove any pre-release suffix like -alpha.1, -dev+abc123, etc.)
+          # Examples: 0.2.0 -> 0.2.0, 0.2.0-alpha.1 -> 0.2.0, 0.2.1-dev+abc123 -> 0.2.1
+          BASE_VERSION=$(echo "$CURRENT_VERSION" | sed 's/-.*//')
+          echo "Base version: $BASE_VERSION"
+          
+          # Parse version components (MAJOR.MINOR.PATCH)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
+          
+          # Generate pre-release version: increment patch and add -dev suffix
+          # Format: MAJOR.MINOR.(PATCH+1)-dev+COMMIT_SHA
+          NEW_PATCH=$((PATCH + 1))
+          PRE_RELEASE_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-dev+${GITHUB_SHA:0:7}"
+          
+          echo "Pre-release version: $PRE_RELEASE_VERSION"
+          echo "version=$PRE_RELEASE_VERSION" >> $GITHUB_OUTPUT
+          
+          # Update Chart.yaml with pre-release version
+          # GitHub Actions runs on Linux, so use Linux sed syntax
+          sed -i "s/^version:.*/version: $PRE_RELEASE_VERSION/" helm/Chart.yaml
+          
+          echo "Updated Chart.yaml version to: $PRE_RELEASE_VERSION"
+          cat helm/Chart.yaml
+
+      - name: Set final version
+        id: version
+        run: |
+          if [ "${{ steps.tag.outputs.is_main_branch }}" == "true" ]; then
+            FINAL_VERSION="${{ steps.prerelease.outputs.version }}"
+          else
+            FINAL_VERSION="${{ steps.tag.outputs.version }}"
+          fi
+          echo "version=$FINAL_VERSION" >> $GITHUB_OUTPUT
+          echo "Final Chart Version: $FINAL_VERSION"
+
+      - name: Validate Helm chart
+        run: |
+          cd helm
+          helm lint .
+
+      - name: Package Helm chart
+        id: package
+        run: |
+          cd helm
+          helm package . --destination ./dist
+          CHART_FILE=$(ls ./dist/*.tgz)
+          echo "chart_file=$CHART_FILE" >> $GITHUB_OUTPUT
+          echo "chart_name=$(basename $CHART_FILE)" >> $GITHUB_OUTPUT
+          echo "Packaged chart: $CHART_FILE"
+
+      - name: Generate chart checksum and digest
+        id: checksum
+        run: |
+          cd helm/dist
+          sha256sum *.tgz > checksums.txt
+          DIGEST=$(sha256sum *.tgz | awk '{print $1}')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Generated checksums.txt"
+          echo "Chart Digest (SHA256): $DIGEST"
+
+      - name: Determine release type
+        id: release
+        run: |
+          IS_V_TAG=false
+          if [[ "${{ steps.tag.outputs.tag }}" == v* ]]; then
+            IS_V_TAG=true
+          fi
+          
+          # v* tags create normal releases
+          # main branch updates create/update "latest" release
+          if [ "${{ steps.tag.outputs.is_tag }}" == "true" ] && [ "$IS_V_TAG" == "true" ]; then
+            RELEASE_TYPE="tag"
+            RELEASE_TAG="${{ steps.tag.outputs.tag }}"
+          elif [ "${{ steps.tag.outputs.is_main_branch }}" == "true" ]; then
+            RELEASE_TYPE="latest"
+            RELEASE_TAG="latest"
+          else
+            RELEASE_TYPE="none"
+            RELEASE_TAG=""
+          fi
+          
+          echo "release_type=$RELEASE_TYPE" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "should_release=$([ "$RELEASE_TYPE" != "none" ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
+          echo "Release Type: $RELEASE_TYPE"
+          echo "Release Tag: $RELEASE_TAG"
+
+      - name: Create/Update GitHub Release (v* tag)
+        if: steps.release.outputs.release_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.release_tag }}
+          name: Release ${{ steps.release.outputs.release_tag }}
+          body: |
+            ## Helm Chart Release ${{ steps.release.outputs.release_tag }}
+            
+            ### Chart Information
+            - **Chart Version**: ${{ steps.version.outputs.version }}
+            - **Tag**: ${{ steps.release.outputs.release_tag }}
+            - **Commit**: ${{ github.sha }}
+            
+            ### Installation
+            
+            ```bash
+            helm repo add curvineio https://curvineio.github.io/helm-charts
+            helm repo update
+            helm install curvine curvineio/curvine
+            ```
+            
+            ### Files
+            - Chart package: `${{ steps.package.outputs.chart_name }}`
+            - Checksums: `checksums.txt`
+            - Digest (SHA256): `${{ steps.checksum.outputs.digest }}`
+          files: |
+            helm/dist/*.tgz
+            helm/dist/checksums.txt
+          draft: false
+          prerelease: ${{ contains(steps.release.outputs.release_tag, '-') || contains(steps.release.outputs.release_tag, 'alpha') || contains(steps.release.outputs.release_tag, 'beta') || contains(steps.release.outputs.release_tag, 'rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Create/Update GitHub Release (main branch -> latest)
+        if: steps.release.outputs.release_type == 'latest'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Release (main branch)
+          body: |
+            ## Latest Helm Chart Release
+            
+            This release is automatically updated on every push to the `main` branch.
+            
+            ### Chart Information
+            - **Chart Version**: ${{ steps.version.outputs.version }}
+            - **Branch**: main
+            - **Commit**: ${{ github.sha }}
+            - **Commit Message**: ${{ github.event.head_commit.message }}
+            
+            ### Installation
+            
+            ```bash
+            helm repo add curvineio https://curvineio.github.io/helm-charts
+            helm repo update
+            helm install curvine curvineio/curvine
+            ```
+            
+            ### Files
+            - Chart package: `${{ steps.package.outputs.chart_name }}`
+            - Checksums: `checksums.txt`
+            - Digest (SHA256): `${{ steps.checksum.outputs.digest }}`
+            
+            > **Note**: This is an automatically updated release. For stable versions, use tagged releases (v*).
+          files: |
+            helm/dist/*.tgz
+            helm/dist/checksums.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload chart artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-${{ steps.tag.outputs.tag }}
+          path: |
+            helm/dist/*.tgz
+            helm/dist/checksums.txt
+          retention-days: 90
+      
+      - name: Build Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag/Version**: ${{ steps.tag.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Chart Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Chart Package**: ${{ steps.package.outputs.chart_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest (SHA256)**: ${{ steps.checksum.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Type**: ${{ steps.release.outputs.release_type }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Release Tag**: ${{ steps.release.outputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Is Tag**: ${{ steps.tag.outputs.is_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Is Main Branch**: ${{ steps.tag.outputs.is_main_branch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Release Created**: ${{ steps.release.outputs.should_release }}" >> $GITHUB_STEP_SUMMARY
+
