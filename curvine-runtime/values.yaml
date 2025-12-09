@@ -143,6 +143,9 @@ worker:
     # requiredDuringSchedulingIgnoredDuringExecution or preferredDuringSchedulingIgnoredDuringExecution
     type: "preferred"
   
+  # Affinity (for custom node affinity, pod affinity rules)
+  affinity: {}
+  
   # Additional labels
   labels: {}
   
@@ -161,6 +164,11 @@ worker:
 # Service configuration
 service:
   master:
+    # Headless service type (always ClusterIP: None)
+    type: ClusterIP
+    annotations: {}
+  
+  worker:
     # Headless service type (always ClusterIP: None)
     type: ClusterIP
     annotations: {}
